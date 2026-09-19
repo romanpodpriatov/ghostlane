@@ -37,7 +37,7 @@ class XrayConfigRoutingTest {
         XrayConfig.buildXhttp(xhttp(host), routing = routing, geodata = geodata, answersDns = answersDns)
     ).jsonObject
 
-    private fun bypass() = Routing.BypassRussia("unused-on-xray", DirectDns.Placeholder)
+    private fun bypass() = Routing.Rules("unused-on-xray", DirectDns.Placeholder)
 
     private fun JsonObject.str(key: String) = this[key]!!.jsonPrimitive.content
     private fun JsonArray.strings() = map { it.jsonPrimitive.content }

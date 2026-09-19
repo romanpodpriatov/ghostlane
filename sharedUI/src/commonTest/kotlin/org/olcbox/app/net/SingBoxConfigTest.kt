@@ -134,7 +134,9 @@ class SingBoxConfigTest {
         val rules = lossyUdp()["route"]!!.jsonObject["rules"]!!.jsonArray.map { it.jsonObject }
         assertEquals("hijack-dns", str(rules[1], "action"))
         assertEquals(53, rules[1]["port"]!!.jsonPrimitive.content.toInt())
-        assertTrue(rules.none { it["action"]?.jsonPrimitive?.content == "reject" }, "nothing may reject UDP: calls and games ride it")
+        assertTrue(rules.filter { it["action"]?.jsonPrimitive?.content == "reject" }
+            .all { it["ip_version"]?.jsonPrimitive?.content == "6" },
+            "only IPv6 may be rejected: IPv4 UDP calls and games must keep flowing")
     }
 
     @Test fun socksShapesStayDnsFreeInGlobal() {
@@ -190,11 +192,13 @@ class SingBoxConfigTest {
         // seconds, and a refusal is all a client needs to carry on without one.
         for ((name, json) in iosShapes()) {
             val rules = obj(json)["dns"]!!.jsonObject["rules"]!!.jsonArray.map { it.jsonObject }
-            assertEquals(2, rules.size, name)
-            assertEquals(listOf("A", "AAAA"), strings(rules[0], "query_type"), name)
-            assertEquals("dns-fakeip", str(rules[0], "server"), name)
-            assertEquals(listOf("HTTPS"), strings(rules[1], "query_type"), name)
-            assertEquals("reject", str(rules[1], "action"), name)
+            assertEquals(3, rules.size, name)
+            assertEquals(listOf("AAAA"), strings(rules[0], "query_type"), name)
+            assertEquals("reject", str(rules[0], "action"), name)
+            assertEquals(listOf("A"), strings(rules[1], "query_type"), name)
+            assertEquals("dns-fakeip", str(rules[1], "server"), name)
+            assertEquals(listOf("HTTPS"), strings(rules[2], "query_type"), name)
+            assertEquals("reject", str(rules[2], "action"), name)
             assertEquals("dns-remote", str(obj(json)["dns"]!!.jsonObject, "final"), name)
         }
     }
@@ -211,17 +215,19 @@ class SingBoxConfigTest {
     @Test fun bypassOnIosResolvesRussianNamesForRealBeforeFakingTheRest() {
         for ((name, json) in iosShapes(bypass(DirectDns.Placeholder))) {
             val rules = obj(json)["dns"]!!.jsonObject["rules"]!!.jsonArray.map { it.jsonObject }
-            assertEquals(3, rules.size, name)
-            assertEquals(RuleSets.domains.map { it.tag }, strings(rules[0], "rule_set"), name)
-            assertEquals("dns-direct", str(rules[0], "server"), name)
-            assertEquals("dns-fakeip", str(rules[1], "server"), name)
-            assertEquals("reject", str(rules[2], "action"), name)
+            assertEquals(4, rules.size, name)
+            assertEquals(listOf("AAAA"), strings(rules[0], "query_type"), name)
+            assertEquals("reject", str(rules[0], "action"), name)
+            assertEquals(RuleSets.domains.map { it.tag }, strings(rules[1], "rule_set"), name)
+            assertEquals("dns-direct", str(rules[1], "server"), name)
+            assertEquals("dns-fakeip", str(rules[2], "server"), name)
+            assertEquals("reject", str(rules[3], "action"), name)
         }
     }
 
     @Test fun iosGlobalShapesRouteOnlyDnsAndKeepOneOutbound() {
         for ((name, json) in iosShapes()) {
-            assertEquals(2, routeRules(json).size, name)
+            assertEquals(3, routeRules(json).size, name)
             assertEquals(1, obj(json)["outbounds"]!!.jsonArray.size, name)
         }
     }
@@ -360,6 +366,20 @@ class SingBoxConfigTest {
     }
 
     @Test
+    fun desktopTunUsesTheRequestedPerStartInterfaceName() {
+        // Windows can keep a Wintun adapter alive briefly after its owning
+        // process exits. A new connection must be able to use a fresh name
+        // instead of racing the pending removal of the previous adapter.
+        val json = SingBoxConfig.buildDesktopTun(
+            corePort = 10810,
+            verifyPort = 10811,
+            interfaceName = "Ghostlane-a4-2"
+        )
+        val tun = obj(json)["inbounds"]!!.jsonArray.first().jsonObject
+        assertEquals("Ghostlane-a4-2", str(tun, "interface_name"))
+    }
+
+    @Test
     fun desktopTunSendsTheServerDomainToTheSystemResolverDirect() {
         // The core redials while the tun is up. Its DNS query for the server's
         // own hostname enters the tun like everything else, and answering it
@@ -465,7 +485,7 @@ class SingBoxConfigTest {
 
     // --- desktop tun under Bypass Russia, and its DNS ------------------------
 
-    private fun desktopBypass() = Routing.BypassRussia(
+    private fun desktopBypass() = Routing.Rules(
         ruleSetDir = "/Library/Application Support/org.olcbox.app/rules",
         directDns = DirectDns.System
     )
@@ -509,7 +529,7 @@ class SingBoxConfigTest {
             assertEquals("local", str(servers[1], "type"), name)
             val rules = obj(json)["dns"]!!.jsonObject["rules"]!!.jsonArray.map { it.jsonObject }
             val fake = rules.first { it["server"]?.jsonPrimitive?.content == "dns-fakeip" }
-            assertEquals(listOf("A", "AAAA"), strings(fake, "query_type"), name)
+            assertEquals(listOf("A"), strings(fake, "query_type"), name)
             assertEquals("reject", str(rules.last(), "action"), name)
             assertEquals(listOf("HTTPS"), strings(rules.last(), "query_type"), name)
             assertEquals("dns-remote", str(obj(json)["dns"]!!.jsonObject, "final"), name)
@@ -522,8 +542,9 @@ class SingBoxConfigTest {
         // The server's own name stays ahead of everything: it is what the core
         // redials, and answering it through the tunnel needs the tunnel.
         val lossyRules = obj(shapes["lossy"]!!)["dns"]!!.jsonObject["rules"]!!.jsonArray.map { it.jsonObject }
-        assertEquals(listOf("de1.example.org"), strings(lossyRules[0], "domain"))
-        assertEquals("dns-direct", str(lossyRules[0], "server"))
+        assertEquals(listOf("AAAA"), strings(lossyRules[0], "query_type"))
+        assertEquals(listOf("de1.example.org"), strings(lossyRules[1], "domain"))
+        assertEquals("dns-direct", str(lossyRules[1], "server"))
     }
 
     @Test
@@ -545,7 +566,9 @@ class SingBoxConfigTest {
         val direct = obj(json)["outbounds"]!!.jsonArray.map { it.jsonObject }.first { str(it, "tag") == "direct" }
         assertEquals("en0", str(direct, "bind_interface"))
         val dnsRules = obj(json)["dns"]!!.jsonObject["rules"]!!.jsonArray.map { it.jsonObject }
-        assertEquals(RuleSets.domains.map { it.tag }, strings(dnsRules[0], "rule_set"))
+        assertEquals(listOf("AAAA"), strings(dnsRules[0], "query_type"))
+        assertEquals("reject", str(dnsRules[0], "action"))
+        assertEquals(RuleSets.domains.map { it.tag }, strings(dnsRules[1], "rule_set"))
     }
 
     @Test
@@ -568,7 +591,7 @@ class SingBoxConfigTest {
     // --- Bypass Russia -----------------------------------------------------
 
     private fun bypass(dns: DirectDns = DirectDns.Servers(listOf("10.20.30.40"))) =
-        Routing.BypassRussia(ruleSetDir = "/data/rules", directDns = dns)
+        Routing.Rules(ruleSetDir = "/data/rules", directDns = dns)
     private fun obj(json: String) = Json.parseToJsonElement(json).jsonObject
     private fun routeRules(json: String) = obj(json)["route"]!!.jsonObject["rules"]!!.jsonArray.map { it.jsonObject }
     private fun dnsServers(json: String) = obj(json)["dns"]!!.jsonObject["servers"]!!.jsonArray.map { it.jsonObject }
@@ -617,7 +640,7 @@ class SingBoxConfigTest {
     @Test fun bypassRoutesRussiaAndTheLocalNetworkDirectAndTheRestThroughTheTunnel() {
         for ((name, json) in shapes(bypass())) {
             val rules = routeRules(json)
-            assertEquals(4, rules.size, name)
+            assertEquals(5, rules.size, name)
             assertEquals("sniff", str(rules[0], "action"), name)
             assertEquals("hijack-dns", str(rules[1], "action"), name)
             assertEquals(53, rules[1]["port"]!!.jsonPrimitive.content.toInt(), name)
@@ -625,9 +648,24 @@ class SingBoxConfigTest {
             assertEquals("direct", str(rules[2], "outbound"), name)
             assertEquals(RuleSets.all.map { it.tag }, strings(rules[3], "rule_set"), name)
             assertEquals("direct", str(rules[3], "outbound"), name)
+            assertEquals("reject", str(rules[4], "action"), name)
+            assertEquals(6, rules[4]["ip_version"]!!.jsonPrimitive.content.toInt(), name)
             assertEquals("out", str(obj(json)["route"]!!.jsonObject, "final"), name)
             assertEquals("dns-direct", str(obj(json)["route"]!!.jsonObject, "default_domain_resolver"), name)
         }
+    }
+
+    @Test fun allowingIpv6RemovesTheDnsAndRouteRejections() {
+        val routing = Routing.Rules(
+            ruleSetDir = "/data/rules",
+            directDns = DirectDns.Servers(listOf("10.20.30.40")),
+            region = null,
+            disableIpv6 = false
+        )
+        val json = SingBoxConfig.buildTun(vless(), routing = routing)
+        val dnsRules = obj(json)["dns"]!!.jsonObject["rules"]!!.jsonArray.map { it.jsonObject }
+        assertTrue(dnsRules.none { strings(it, "query_type") == listOf("AAAA") })
+        assertTrue(routeRules(json).none { it["ip_version"]?.jsonPrimitive?.content == "6" })
     }
 
     @Test fun bypassAddsADirectOutboundAfterTheTunnelOne() {
@@ -653,8 +691,10 @@ class SingBoxConfigTest {
             // refuses at start a detour to a direct outbound with no options.
             assertNull(servers[1]["detour"], name)
             val rules = dns["rules"]!!.jsonArray.map { it.jsonObject }
-            assertEquals(RuleSets.domains.map { it.tag }, strings(rules[0], "rule_set"), name)
-            assertEquals("dns-direct", str(rules[0], "server"), name)
+            assertEquals(listOf("AAAA"), strings(rules[0], "query_type"), name)
+            assertEquals("reject", str(rules[0], "action"), name)
+            assertEquals(RuleSets.domains.map { it.tag }, strings(rules[1], "rule_set"), name)
+            assertEquals("dns-direct", str(rules[1], "server"), name)
             assertEquals("dns-remote", str(dns, "final"), name)
             assertEquals(true, dns["reverse_mapping"]!!.jsonPrimitive.content.toBoolean(), name)
         }
@@ -686,7 +726,8 @@ class SingBoxConfigTest {
 
     @Test fun bypassKeepsUdpFlowing() {
         for ((name, json) in shapes(bypass())) {
-            assertTrue(routeRules(json).none { it["action"]?.jsonPrimitive?.content == "reject" }, name)
+            assertTrue(routeRules(json).filter { it["action"]?.jsonPrimitive?.content == "reject" }
+                .all { it["ip_version"]?.jsonPrimitive?.content == "6" }, name)
         }
     }
 
