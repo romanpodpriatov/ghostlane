@@ -156,6 +156,7 @@ class OlcboxVpnService : VpnService() {
 
     /** The routing choice read at the last start, so a reconnect in place keeps it. */
     private var routingMode = RoutingMode.Global
+    private var blockAds = false
 
     /**
      * Whether sing-box is standing in front of olcRTC. Both then have to be
@@ -485,7 +486,9 @@ class OlcboxVpnService : VpnService() {
                         return@withLock
                     }
                     OlcboxVpnState.activeLocation = location.normalized()
-                    routingMode = repository.getRoutingSettings().mode
+                    val routingSettings = repository.getRoutingSettings()
+                    routingMode = routingSettings.mode
+                    blockAds = routingSettings.blockAds
 
                     if (isMigration && !forceFullRestart && canReconnectTransportInPlace()) {
                         reconnectTransport(location, requestedGeneration)
@@ -702,7 +705,7 @@ class OlcboxVpnService : VpnService() {
         return if (location.kind == LocationKind.Olcrtc) {
             activeCorePort = null
             val started = startMobile(location, upstream, requestedGeneration, setErrorOnFailure)
-            if (started && routing is Routing.BypassRussia) startFront(routing, setErrorOnFailure) else started
+            if (started && routing is Routing.Rules) startFront(routing, setErrorOnFailure) else started
         } else {
             startCore(location, setErrorOnFailure, routing)
         }
@@ -714,7 +717,7 @@ class OlcboxVpnService : VpnService() {
      * the promised endpoint is olcRTC's own port, and a front there would be a
      * second port nobody was told about.
      */
-    private suspend fun startFront(routing: Routing.BypassRussia, setErrorOnFailure: Boolean): Boolean {
+    private suspend fun startFront(routing: Routing.Rules, setErrorOnFailure: Boolean): Boolean {
         if (connectionMode != AndroidConnectionMode.Tun) {
             addLog("Routing: proxy mode keeps olcRTC global")
             return true
@@ -797,7 +800,7 @@ class OlcboxVpnService : VpnService() {
             // Which processes must be alive once the port answers. A port that
             // answers proves nothing about who answers.
             val alive: () -> Boolean
-            val fronted = routing is Routing.BypassRussia && connectionMode == AndroidConnectionMode.Tun
+            val fronted = routing is Routing.Rules && connectionMode == AndroidConnectionMode.Tun
             if (spec is OutboundSpec.Vless && spec.transport is TransportSpec.Xhttp) {
                 if (fronted) {
                     // Xray does not route; sing-box does, so it goes in front.
@@ -809,7 +812,7 @@ class OlcboxVpnService : VpnService() {
                     diagnose = { singBoxCore.diagnostics() + "\n" + xrayCore.diagnostics() }
                     alive = { singBoxCore.isRunning() && xrayCore.isRunning() }
                 } else {
-                    if (routing is Routing.BypassRussia) addLog("Routing: proxy mode keeps xhttp global")
+                    if (routing is Routing.Rules) addLog("Routing: proxy mode keeps xhttp global")
                     xrayCore.start(XrayConfig.buildXhttp(spec, socksPort = port))
                     label = "Xray/xhttp"
                     diagnose = xrayCore::diagnostics
@@ -1005,6 +1008,11 @@ class OlcboxVpnService : VpnService() {
                 .setMtu(TUN_MTU)
                 .addAddress(TUN_IPV4_ADDRESS, IPV4_PREFIX_LENGTH)
                 .addRoute("0.0.0.0", 0)
+                // Claim IPv6 too. With the default Disable mode the core rejects
+                // it immediately; without this route Android would leak it around
+                // an otherwise system-wide VPN before our rules could see it.
+                .addAddress(TUN_IPV6_ADDRESS, IPV6_PREFIX_LENGTH)
+                .addRoute("::", 0)
                 .addDnsServer(MAPDNS_ADDRESS)
                 .setBlocking(true)
 
@@ -1741,17 +1749,16 @@ class OlcboxVpnService : VpnService() {
      * network's resolvers for direct names. Files are rewritten on every start —
      * 59 KB, and the alternative is a version check that can be wrong.
      */
-    private suspend fun routingFor(upstream: Network?): Routing = when (routingMode) {
-        RoutingMode.Global -> Routing.Global
-        RoutingMode.BypassRussia -> {
-            val dir = File(filesDir, RULE_SETS_DIR).apply { mkdirs() }
-            for (file in RuleSets.all) File(dir, file.name).writeBytes(RuleSets.bytes(file))
-            addLog("Routing: ${routingMode.hubSummary()}")
-            Routing.BypassRussia(
-                ruleSetDir = dir.absolutePath,
-                directDns = DirectDns.Servers(upstreamDnsAddresses(upstream))
-            )
-        }
+    private suspend fun routingFor(upstream: Network?): Routing {
+        val settings = repository.getRoutingSettings()
+        val dir = File(filesDir, RULE_SETS_DIR).apply { mkdirs() }
+        val routing = Routing.Rules(
+            dir.absolutePath, DirectDns.Servers(upstreamDnsAddresses(upstream)), routingMode.region,
+            blockAds, settings.disableIpv6
+        )
+        for (file in RuleSets.selected(routing)) File(dir, file.name).writeBytes(RuleSets.bytes(file))
+        addLog("Routing: ${routingMode.hubSummary()}")
+        return routing
     }
 
     /** The network's resolvers as the system lists them, for the direct DNS server. */
@@ -2124,6 +2131,8 @@ class OlcboxVpnService : VpnService() {
         private const val FRONT_ALTERNATE_PORT = 10812
         private const val TUN_IPV4_ADDRESS = "10.0.88.88"
         private const val IPV4_PREFIX_LENGTH = 24
+        private const val TUN_IPV6_ADDRESS = "fdfe:dcba:9876::1"
+        private const val IPV6_PREFIX_LENGTH = 126
         private const val MAPDNS_ADDRESS = "1.1.1.1"
         private const val MAPDNS_NETWORK = "100.64.0.0"
         private const val MAPDNS_NETMASK = "255.192.0.0"
